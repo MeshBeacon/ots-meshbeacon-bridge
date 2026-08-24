@@ -1,4 +1,4 @@
-# ots-meshbeacon-bridge
+# ots-meshbeacon-plugin
 
 OpenTAKServer plugin that bridges [MeshBeacon](https://github.com/MeshBeacon/meshbeacon)
 Duck telemetry into OpenTAKServer as CoT events, and relays operator commands
