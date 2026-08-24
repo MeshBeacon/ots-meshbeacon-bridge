@@ -26,6 +26,11 @@ jobs:
       - name: Build wheel and sdist
         run: poetry build
 
+      - name: Verify wheel was generated
+        run: |
+          ls -la dist/
+          test -n "$(find dist -maxdepth 1 -name '*.whl')" || (echo "::error::No wheel file found in dist/" && exit 1)
+
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -37,3 +42,5 @@ jobs:
         with:
           files: dist/*
           generate_release_notes: true
+          draft: false
+          fail_on_unmatched_files: true
