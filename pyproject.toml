@@ -1,0 +1,19 @@
+[tool.poetry]
+name = "ots-meshbeacon-bridge"
+version = "1.0.0"
+description = "OpenTAKServer plugin bridging MeshBeacon Duck telemetry over an encrypted MQTT link"
+authors = ["OpenTAKServer <zaihan@meshbeacon.org>"]
+readme = "README.md"
+packages = [{ include = "ots_meshbeacon_bridge" }]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+cryptography = "*"
+paho-mqtt = "^2.0"
+
+[tool.poetry.plugins."opentakserver.plugin"]
+meshbeacon = "ots_meshbeacon_bridge.plugin:MeshBeaconPlugin"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
