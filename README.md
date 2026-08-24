@@ -5,6 +5,10 @@ Duck telemetry into OpenTAKServer as CoT events, and relays operator commands
 back to the mesh -- all over an encrypted MQTT link. See MeshBeacon's
 `docs/OPENTAK_BRIDGE.md` for the matching server-side setup.
 
+See this repo's [wiki](https://github.com/MeshBeacon/ots-meshbeacon-bridge/wiki)
+for the full architecture, telemetry-to-CoT field mapping, and troubleshooting
+guide.
+
 ## How it works
 
 1. MeshBeacon encrypts each Duck telemetry record and publishes it on
