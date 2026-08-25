@@ -8,9 +8,10 @@ import threading
 import traceback
 import uuid
 from importlib import metadata as importlib_metadata
-from xml.etree.ElementTree import Element, SubElement, tostring
+from xml.etree.ElementTree import Element, SubElement, fromstring, tostring
 
 import paho.mqtt.client as mqtt
+import pika
 import sqlalchemy.exc
 from flask import Flask
 
@@ -43,6 +44,18 @@ class MeshBeaconPlugin(Plugin):
         self._command_topic = "hub/opentak/command"
         self._lock = threading.Lock()
         self._connected = False
+
+        # Relays GeoChat replies typed in ATAK/WinTAK/iTAK back to the mesh.
+        # OTS's own cot_parser only relays outgoing GeoChat to Meshtastic
+        # (hardcoded, gated by OTS_ENABLE_MESHTASTIC) -- there's no generic
+        # plugin hook for other bridges, so this plugin binds its own queue
+        # to OTS's "cot_parser" direct exchange to get a copy of every parsed
+        # CoT event (same envelope EudHandler/meshtastic_controller publish:
+        # {"uid":..., "cot": "<event .../>"}) alongside cot_parser's own
+        # queue, without needing any change to OTS core.
+        self._geochat_thread: threading.Thread | None = None
+        self._geochat_stop = threading.Event()
+        self._geochat_connection: pika.BlockingConnection | None = None
 
     def load_metadata(self) -> dict:
         # Pull real package metadata when available (e.g. author, license,
@@ -160,7 +173,23 @@ class MeshBeaconPlugin(Plugin):
             logger.error(f"MeshBeacon plugin: failed to connect to MQTT broker {host}:{port}: {e}")
             logger.debug(traceback.format_exc())
 
+        self._geochat_stop.clear()
+        self._geochat_thread = threading.Thread(
+            target=self._geochat_listener_loop, name="meshbeacon-geochat-listener", daemon=True
+        )
+        self._geochat_thread.start()
+
     def stop(self) -> None:
+        self._geochat_stop.set()
+        if self._geochat_connection is not None:
+            try:
+                self._geochat_connection.close()
+            except BaseException:
+                pass
+        if self._geochat_thread is not None:
+            self._geochat_thread.join(timeout=5)
+            self._geochat_thread = None
+
         if self._mqtt_client is not None:
             try:
                 self._mqtt_client.loop_stop()
@@ -191,6 +220,122 @@ class MeshBeaconPlugin(Plugin):
     def _on_disconnect(self, client, userdata, rc) -> None:
         self._connected = False
         self._logger.warning(f"MeshBeacon plugin: MQTT disconnected, rc={rc}")
+
+    # -- ATAK/WinTAK/iTAK GeoChat -> MeshBeacon command ----------------------
+
+    def _geochat_listener_loop(self) -> None:
+        """
+        Reconnects with backoff for as long as the plugin is active. A
+        single dropped connection (broker restart, network blip, etc.)
+        would otherwise silently and permanently stop GeoChat replies from
+        ever reaching the mesh again until OTS itself was restarted.
+        """
+        while not self._geochat_stop.is_set():
+            try:
+                self._consume_geochat_once()
+            except BaseException as e:
+                if self._geochat_stop.is_set():
+                    break
+                self._logger.warning(f"MeshBeacon plugin: GeoChat listener error, retrying: {e}")
+                self._logger.debug(traceback.format_exc())
+            self._geochat_stop.wait(5)
+
+    def _consume_geochat_once(self) -> None:
+        """
+        Binds a queue of our own to OTS's existing "cot_parser" direct
+        exchange (routing key "cot_parser"), the same exchange EudHandler
+        and the Meshtastic controller publish every parsed CoT event to.
+        Because it's a *direct* exchange, a second queue bound with the
+        same routing key gets its own copy of every message -- this runs
+        entirely alongside OTS's own cot_parser consumer without needing
+        any change to OTS core, which has no generic "outgoing GeoChat"
+        hook for third-party bridges (only Meshtastic is wired in,
+        hardcoded in cot_parser.parse_geochat()).
+        """
+        host = self._app.config.get("OTS_RABBITMQ_SERVER_ADDRESS", "127.0.0.1")
+        username = self._app.config.get("OTS_RABBITMQ_USERNAME", "guest")
+        password = self._app.config.get("OTS_RABBITMQ_PASSWORD", "guest")
+
+        credentials = pika.PlainCredentials(username, password)
+        connection = pika.BlockingConnection(
+            pika.ConnectionParameters(host=host, credentials=credentials)
+        )
+        self._geochat_connection = connection
+        channel = connection.channel()
+        channel.exchange_declare("cot_parser", durable=True, exchange_type="direct")
+        channel.queue_declare(queue="meshbeacon_bridge_geochat", auto_delete=True)
+        channel.queue_bind(
+            exchange="cot_parser", queue="meshbeacon_bridge_geochat", routing_key="cot_parser"
+        )
+        channel.basic_consume(
+            queue="meshbeacon_bridge_geochat",
+            on_message_callback=self._on_geochat_message,
+            auto_ack=True,
+        )
+        self._logger.info("MeshBeacon plugin: listening for GeoChat replies to relay to the mesh")
+        try:
+            channel.start_consuming()
+        finally:
+            self._geochat_connection = None
+
+    def _on_geochat_message(self, channel, method, properties, body: bytes) -> None:
+        try:
+            envelope = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return
+
+        cot_xml = envelope.get("cot")
+        if not cot_xml:
+            # Disconnect notifications and other non-CoT envelopes carry no
+            # "cot" payload -- nothing to parse.
+            return
+
+        try:
+            event = fromstring(cot_xml)
+        except BaseException:
+            return
+
+        if event.get("type") != "b-t-f":
+            # Not a GeoChat event (position update, alert, etc.)
+            return
+
+        detail = event.find("detail")
+        if detail is None:
+            return
+        chatgrp = detail.find("chatgrp")
+        remarks = detail.find("remarks")
+        if chatgrp is None or remarks is None or not remarks.text:
+            return
+
+        sender_uid = chatgrp.get("uid0", "")
+        if sender_uid.startswith("meshbeacon-"):
+            # Echo of a chat message this plugin itself already relayed
+            # from MeshBeacon into OTS (_build_geochat_cot) -- ignore, or
+            # every Duck message would immediately bounce back to itself.
+            return
+
+        # A 1:1 DM's chatgrp carries the recipient's uid in a "uidN"
+        # attribute (N >= 1); broadcasts to "All Chat Rooms" don't name any
+        # specific EUD here, so they're intentionally not relayed -- only
+        # replies addressed to a specific Duck's contact are.
+        for attr, uid in chatgrp.attrib.items():
+            if not attr.startswith("uid") or attr == "uid0":
+                continue
+            if not uid.startswith("meshbeacon-"):
+                continue
+
+            duck_id = uid[len("meshbeacon-") :]
+            message = remarks.text
+            sent = self.send_command(duck_id, message)
+            if sent:
+                self._logger.info(
+                    f"MeshBeacon plugin: relayed GeoChat reply to duck_id={duck_id}"
+                )
+            else:
+                self._logger.warning(
+                    f"MeshBeacon plugin: failed to relay GeoChat reply to duck_id={duck_id} "
+                    "(bridge not connected/configured)"
+                )
 
     # -- CoT delivery ---------------------------------------------------
 

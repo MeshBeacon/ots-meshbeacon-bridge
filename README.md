@@ -19,6 +19,43 @@ guide.
 3. Operators can send a command back to a specific Duck via this plugin's
    `/api/meshbeacon/command` route; the plugin encrypts it and publishes it
    on `hub/opentak/command`, which MeshBeacon's `mqtt-worker` subscribes to.
+4. GeoChat replies typed in ATAK/WinTAK/iTAK directly to a Duck's contact
+   are relayed automatically too: the plugin binds its own queue to OTS's
+   `cot_parser` RabbitMQ exchange (the same one `EudHandler` and the
+   Meshtastic controller publish every parsed CoT event to) and watches for
+   outgoing GeoChat events (`b-t-f`) addressed to a `meshbeacon-<duck_id>`
+   contact, forwarding the message text through step 3 above. Only 1:1 DMs
+   to a specific Duck are relayed this way -- broadcasts to "All Chat
+   Rooms" are not, to avoid spamming every Duck on the mesh.
+
+## Replying to a Duck -- read this before an incident
+
+Every message a Duck sends in arrives in **"All Chat Rooms"** (broadcast),
+not a private DM -- this is intentional: a Duck has no way to address a
+message to a specific human operator, and in a disaster/offgrid scenario
+the priority is that *whoever is on shift* sees it immediately, not that
+it's routed to a pre-selected recipient. (A dedicated SOS still raises a
+real OTS Alert independently of chat, so an emergency doesn't depend on
+someone noticing the broadcast.)
+
+**But replying only works from a direct 1:1 chat with that Duck's contact,
+not by typing in "All Chat Rooms".** The plugin's GeoChat relay (item 4
+above) only watches for private DMs addressed to the Duck's
+`meshbeacon-<duck_id>` contact -- a reply typed inline in the broadcast
+room is never seen by the relay and will silently never reach the Duck.
+
+To reply to a Duck from ATAK/WinTAK/iTAK:
+
+1. Open the **Contacts** list (not the "All Chat Rooms" tab).
+2. Find the Duck (it appears as an EUD contact using its `duck_id` as the
+   callsign, once it's sent at least one telemetry update).
+3. Start a **direct/private chat** with that contact and send the message
+   there.
+
+If your operators aren't used to this distinction, prefer sending replies
+through the admin `/api/meshbeacon/command` route (or a dashboard button
+that calls it) instead of training everyone on the DM-vs-broadcast
+convention under stress.
 
 ## Encryption
 
